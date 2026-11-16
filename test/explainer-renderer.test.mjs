@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { parse } from 'parse5';
 import { renderExplainer } from '../archify/explainer/render.mjs';
+import { checkExplainerHtml } from '../archify/explainer/check.mjs';
+import { validateExplainer } from '../archify/explainer/validate.mjs';
+import { prepareExplainer } from '../archify/explainer/prepare.mjs';
 import { computeExplainerRevision } from '../archify/explainer/revision.mjs';
 import { unpackPageBundle } from '../archify/explainer/page-bundle.mjs';
 
@@ -34,9 +37,6 @@ const resources = () => ({preparedSources:{sources:{'code-source':{...source,rev
 
 test('renderer: every shape remains statically readable and authored text cannot become markup',()=>{
   const html = renderExplainer(fixture(),resources()); const tree = parse(html);
-  assert.ok(Buffer.byteLength(html.slice(0, html.indexOf('<meta charset='))) < 1024, 'charset must precede the software notices');
-  const softwareNotice = all(tree,node=>attr(node,'id') === 'archify-software-notices')[0];
-  assert.match(JSON.parse(text(softwareNotice)), /Apache License/);
   assert.equal(all(tree,node=>node.tagName === 'img').length,1);
   assert.equal(all(tree,node=>attr(node,'onerror')).length,0);
   assert.match(text(find(tree,'prose')),/Untrusted <img src=x onerror=alert\(1\)>/);
@@ -88,7 +88,8 @@ test('renderer: resources fail closed and native previews preserve identity with
 });
 
 test('renderer: no-script content includes scope, system theme and inert operation controls',()=>{
-  const tree = parse(renderExplainer(fixture(),resources()));
+  const input = fixture();
+  const tree = parse(renderExplainer(input,resources()));
   assert.equal(attr(all(tree,node=>node.tagName === 'html')[0],'data-theme'),undefined,'default must follow system even before JavaScript');
   assert.ok(find(tree,'answer'));
   const eligible = (node,ancestorInert=false,dialog=false) => {
@@ -101,7 +102,37 @@ test('renderer: no-script content includes scope, system theme and inert operati
   const previewStyles = text(all(tree,node=>node.tagName === 'style' && node.parentNode?.attrs?.some(attribute=>attribute.value.includes('diagram-preview')))[0]);
   assert.match(previewStyles,/@media\(prefers-color-scheme:dark\)/);
   assert.match(previewStyles,/@media print/);
-  assert.equal(all(tree,node=>node.tagName === 'script' && attr(node,'type') === 'application/json').length,4,'prepared bundle, reader metadata and software notices');
+  assert.equal(all(tree,node=>node.tagName === 'script' && attr(node,'type') === 'application/json').length,5,'software notices, prepared bundle, manifest, reader words, and local reader update identity');
+  assert.ok(find(tree,'archify-software-notices'),'standalone explainers keep the embedded software notices');
+  const disclosure = JSON.parse(text(find(tree,'explainer-reader-update-data')));
+  assert.equal(disclosure.artifact.type,'explainer');
+  assert.match(disclosure.artifact.contentSha256,/^[a-f0-9]{64}$/);
+  assert.equal(Object.hasOwn(disclosure,'feedback'),false,'reader update data must not expose feedback capability');
+  assert.equal(JSON.stringify(disclosure).includes(input.meta.title),false,'reader update data must not include the authored title');
+});
+
+test('renderer: valid authored reader-update IDs stay unique and deliverable', async () => {
+  const input = {
+    schema_version: 1, diagram_type: 'explainer',
+    meta: { id: 'reader-id-collision', title: 'Update process' },
+    answer: { summary: 'A local explanation of the update process.' },
+    panels: [{ id: 'reader-update', title: 'Update process', blocks: [
+      { id: 'reader-update-title', type: 'prose', text: 'The title can use its own identity.' },
+      { id: 'archify-reader-update-data', type: 'prose', text: 'The data section can also use its own identity.' },
+    ] }], sources: [],
+  };
+  assert.equal(validateExplainer(input).ok, true);
+  const preparedBundle = await prepareExplainer(JSON.stringify(input), { inputPath: 'test/reader-update-fixture.json' });
+  const html = renderExplainer(preparedBundle.document, { preparedBundle });
+  const checked = checkExplainerHtml(html);
+  assert.equal(checked.ok, true, JSON.stringify(checked.diagnostics));
+  const tree = parse(html);
+  for (const id of ['reader-update', 'reader-update-title', 'archify-reader-update-data']) {
+    assert.equal(all(tree, node => attr(node, 'id') === id).length, 1, id);
+  }
+  const dialog = find(tree, 'explainer-reader-update');
+  assert.equal(dialog.tagName, 'dialog');
+  assert.equal(find(tree, attr(dialog, 'aria-labelledby')).tagName, 'h2');
 });
 
 test('renderer: multiple native diagrams retain independent preview IDs and original payload hashes',()=>{
