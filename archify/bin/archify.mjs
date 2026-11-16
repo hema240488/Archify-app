@@ -2192,7 +2192,7 @@ function invalidProvenance(artifactPath, sidecar, reason, evidence = {}) {
 const COMMAND_USAGE = {
   story: ['scan <native.html> [--json]', 'draft <native.html> <brief.json> [--json]', 'attach <native.html> <brief.json> <enhanced.html> [--json] [--repo-root path]'],
   render: '<type> <input.json> [output.html] [--quality standard|showcase] [--repo-root path]',
-  compare: 'architecture <base.json> <head.json> [output.html] [--receipt path] [--json] [--quality standard|showcase] [--repo-root path]',
+  compare: 'architecture <base.json> <head.json> [output.html] [--receipt path] [--json] [--quality standard|showcase] [--repo-root path] | workflow <base.json> <head.json> [output.json] [--json]',
   deliver: '<type> <input.json> [output.html] [--json] [--open] [--quality standard|showcase] [--repo-root path]',
   patch: 'explainer <artifact.html> <panel-id> <replacement-file> <output.html> [--json] [--quality standard|showcase] [--repo-root path]',
   finalize: '<type> <input.json> <output.html> [--json] [--browser-check] [--receipt path] [--out-dir <dir>] [--quality standard|showcase] [--repo-root path] [--candidate-sha256 hex]',
@@ -3674,7 +3674,180 @@ function renderValidatedArchitecture(inputPath, outputPath, quality, repoRoot, c
   };
 }
 
+async function commandCompareWorkflow(args) {
+  const options = args.filter(arg => arg.startsWith('--'));
+  const json = options.includes('--json');
+  const positional = args.filter(arg => !arg.startsWith('--'));
+  const [, baseInput, headInput, output] = positional;
+  const failure = (code, message, details = {}) => ({
+    schemaVersion: 1, ok: false, command: 'compare', type: 'workflow', code, error: message,
+    diagnostics: details.diagnostics || [{ code, message }], details,
+  });
+  const reportFailure = receipt => {
+    if (json) process.stdout.write(`${JSON.stringify(receipt)}\n`);
+    else process.stderr.write(`${receipt.error}${receipt.diagnostics.length ? `\n${JSON.stringify(receipt.diagnostics, null, 2)}` : ''}\n`);
+    process.exitCode = 1;
+  };
+  if (options.some(option => option !== '--json') || !baseInput || !headInput || positional.length > 4) {
+    return reportFailure(failure('workflow/usage', 'Usage: compare workflow <base.json> <head.json> [output.json] [--json]'));
+  }
+  // Use a single filesystem spelling for alias checks and input reads.
+  // This qualifies Windows drive-relative paths and leaves POSIX traversal intact.
+  const inputs = [baseInput, headInput].map(input => path.toNamespacedPath(input));
+  let destination;
+  if (output) {
+    const { canonicalFuturePath, pathsAlias } = await import('../renderers/shared/output-path.mjs');
+    if (path.extname(output).toLowerCase() !== '.json') {
+      return reportFailure(failure('output/cli-extension', 'Workflow comparison output must use a .json extension.'));
+    }
+    try {
+      // Follow the authored parent path before joining the receipt name.
+      const parent = fs.realpathSync.native(path.dirname(output));
+      if (!fs.statSync(parent).isDirectory()) {
+        return reportFailure(failure('output/cli-resolve', 'Workflow comparison output requires an existing parent directory.'));
+      }
+      const candidate = path.join(parent, path.basename(output));
+      if (path.extname(canonicalFuturePath(candidate)).toLowerCase() !== '.json') {
+        return reportFailure(failure('output/cli-resolved-extension', 'Workflow comparison output must resolve to a .json extension.'));
+      }
+      if (inputs.some(input => pathsAlias(candidate, input))) {
+        return reportFailure(failure('output/cli-alias', 'Workflow comparison output must not replace either input, including through an alias.'));
+      }
+      destination = candidate;
+    } catch (error) {
+      return reportFailure(failure('output/cli-resolve', 'Workflow comparison output requires an existing parent directory and a safely resolvable path.', {
+        reason: error.code || error.archifyDiagnostics?.[0]?.code || 'io-error',
+      }));
+    }
+  }
+  const publishReceipt = receipt => {
+    if (!destination) return true;
+    const temporary = `${destination}.tmp-${process.pid}-${randomUUID()}`;
+    let created = false;
+    try {
+      const fd = fs.openSync(temporary, 'wx');
+      created = true;
+      try { fs.writeFileSync(fd, `${JSON.stringify(receipt, null, 2)}\n`); }
+      finally { fs.closeSync(fd); }
+      fs.renameSync(temporary, destination);
+      return true;
+    } catch (error) {
+      const details = { reason: error.code || 'io-error' };
+      if (!receipt.ok) details.comparisonFailure = receipt.code;
+      if (created) {
+        try { fs.unlinkSync(temporary); }
+        catch (cleanupError) { if (cleanupError.code !== 'ENOENT') details.cleanupFailure = cleanupError.code || 'io-error'; }
+      }
+      reportFailure(failure('output/cli-write', 'Could not write Workflow comparison receipt.', details));
+      return false;
+    }
+  };
+  const failWorkflow = (code, message, details) => {
+    const receipt = failure(code, message, details);
+    if (publishReceipt(receipt)) reportFailure(receipt);
+  };
+  let base;
+  let head;
+  try { base = JSON.parse(fs.readFileSync(inputs[0], 'utf8')); } catch (error) { return failWorkflow('workflow/base-read', `Could not read base Workflow input: ${error.message}`); }
+  try { head = JSON.parse(fs.readFileSync(inputs[1], 'utf8')); } catch (error) { return failWorkflow('workflow/head-read', `Could not read head Workflow input: ${error.message}`); }
+  if (!base || typeof base !== 'object' || Array.isArray(base) || !head || typeof head !== 'object' || Array.isArray(head)) return failWorkflow('workflow/shape', 'Both inputs must be JSON objects.');
+  if (base.diagram_type !== 'workflow' || head.diagram_type !== 'workflow') return failWorkflow('workflow/type', 'Both inputs must declare diagram_type: workflow.');
+  const { validateSchema } = await import('../renderers/shared/validator.mjs');
+  try { validateSchema('workflow', base); } catch (error) { return failWorkflow('workflow/base-invalid', 'Base Workflow input is invalid.', { diagnostics: error.archifyDiagnostics || [] }); }
+  try { validateSchema('workflow', head); } catch (error) { return failWorkflow('workflow/head-invalid', 'Head Workflow input is invalid.', { diagnostics: error.archifyDiagnostics || [] }); }
+  const semanticDiagnostics = (workflow) => {
+    const nodeIds = new Set((workflow.nodes || []).map((node) => node.id));
+    const edgePairs = new Set((workflow.edges || []).map((edge) => `${edge.from}\0${edge.to}`));
+    const diagnostics = [];
+    for (const [index, edge] of (workflow.edges || []).entries()) {
+      for (const field of ['from', 'to']) if (!nodeIds.has(edge[field])) diagnostics.push({
+        code: 'workflow/unknown-endpoint', severity: 'error', message: `Edge "${edge.id}" references unknown ${field} node "${edge[field]}".`,
+        subject: { path: `/edges/${index}/${field}`, edge: edge.id }, evidence: { nodeId: edge[field] }, supportedFixes: [],
+      });
+    }
+    for (const [index, nodeId] of (workflow.mainPath || []).entries()) {
+      if (!nodeIds.has(nodeId)) diagnostics.push({ code: 'workflow/unknown-endpoint', severity: 'error', message: `mainPath references unknown node "${nodeId}".`, subject: { path: `/mainPath/${index}`, mainPath: nodeId }, evidence: { nodeId }, supportedFixes: [] });
+      if (index && !edgePairs.has(`${workflow.mainPath[index - 1]}\0${nodeId}`)) diagnostics.push({ code: 'workflow/main-path-edge', severity: 'error', message: `mainPath step "${workflow.mainPath[index - 1]}" -> "${nodeId}" has no matching edge.`, subject: { path: `/mainPath/${index}` }, evidence: {}, supportedFixes: [] });
+    }
+    return diagnostics;
+  };
+  for (const [label, workflow] of [['base', base], ['head', head]]) {
+    const diagnostics = semanticDiagnostics(workflow);
+    if (diagnostics.length) return failWorkflow(`workflow/${label}-invalid`, `${label === 'base' ? 'Base' : 'Head'} Workflow input is semantically invalid.`, { diagnostics });
+  }
+  const stable = (items, field) => {
+    const map = new Map();
+    for (const item of items || []) {
+      if (!item.id || map.has(item.id)) return null;
+      map.set(item.id, item);
+    }
+    return map;
+  };
+  const baseNodes = stable(base.nodes);
+  const headNodes = stable(head.nodes);
+  const baseEdges = stable(base.edges);
+  const headEdges = stable(head.edges);
+  const baseLanes = stable(base.lanes);
+  const headLanes = stable(head.lanes);
+  const basePhases = stable(base.phases);
+  const headPhases = stable(head.phases);
+  const baseGroups = stable(base.groups);
+  const headGroups = stable(head.groups);
+  if (!baseNodes || !headNodes || !baseEdges || !headEdges || !baseLanes || !headLanes || !basePhases || !headPhases || !baseGroups || !headGroups) return failWorkflow('workflow/identity', 'Workflow nodes, edges, lanes, phases, and groups require unique stable ids.');
+  const nodePresentation = new Set(['row', 'col', 'pos', 'width', 'height', 'x', 'y', 'xOffset', 'yOffset', 'labelDx', 'labelDy']);
+  const edgePresentation = new Set(['fromSide', 'toSide', 'route', 'via', 'labelAt', 'labelDx', 'labelDy', 'labelSegment', 'channelX', 'channelY', 'bias', 'width']);
+  const semantic = (value, ignored) => {
+    if (Array.isArray(value)) return value.map(entry => semantic(entry));
+    if (!value || typeof value !== 'object') return value;
+    return Object.fromEntries(Object.keys(value).filter(key => !ignored?.has(key)).sort().map(key => [key, semantic(value[key])]));
+  };
+  const changes = { lanes: [], phases: [], groups: [], nodes: [], edges: [], mainPath: [], semanticChecks: [] };
+  const compare = (name, beforeItems, afterItems, ignored) => {
+    for (const id of [...new Set([...beforeItems.keys(), ...afterItems.keys()])].sort()) {
+      const before = beforeItems.get(id); const after = afterItems.get(id);
+      if (!before) changes[name].push({ id, change: 'added', head: semantic(after, ignored) });
+      else if (!after) changes[name].push({ id, change: 'removed', base: semantic(before, ignored) });
+      else if (JSON.stringify(semantic(before, ignored)) !== JSON.stringify(semantic(after, ignored))) changes[name].push({ id, change: name === 'edges' && (before.from !== after.from || before.to !== after.to) ? 'endpoint-changed' : 'modified', base: semantic(before, ignored), head: semantic(after, ignored) });
+    }
+  };
+  compare('lanes', baseLanes, headLanes);
+  // Column ranges decide which nodes a phase or group frames, so a range change
+  // is a scope change, not a presentation change.
+  compare('phases', basePhases, headPhases);
+  compare('groups', baseGroups, headGroups);
+  compare('nodes', baseNodes, headNodes, nodePresentation);
+  compare('edges', baseEdges, headEdges, edgePresentation);
+  if (JSON.stringify(base.mainPath || []) !== JSON.stringify(head.mainPath || [])) changes.mainPath.push({ change: 'modified', base: base.mainPath || [], head: head.mainPath || [] });
+  const normalizeSemanticChecks = (checks) => {
+    if (!checks) return null;
+    const identifiers = (values) => [...new Set(values || [])].sort();
+    const relations = (values) => [...new Map((values || []).map(({ from, to }) => [`${from}\0${to}`, { from, to }])).values()]
+      .sort((left, right) => (left.from < right.from ? -1 : left.from > right.from ? 1 : 0) || (left.to < right.to ? -1 : left.to > right.to ? 1 : 0));
+    const normalized = [
+      ['allowedRoots', identifiers],
+      ['allowedTerminals', identifiers],
+      ['requiredEdges', relations],
+      ['requiredPaths', relations],
+    ].filter(([key]) => Object.hasOwn(checks, key)).map(([key, normalize]) => [key, normalize(checks[key])]);
+    return Object.fromEntries([
+      ...normalized.filter(([key, value]) => !(['requiredEdges', 'requiredPaths'].includes(key) && value.length === 0)),
+    ]);
+  };
+  const baseSemanticChecks = normalizeSemanticChecks(base.semanticChecks);
+  const headSemanticChecks = normalizeSemanticChecks(head.semanticChecks);
+  if (JSON.stringify(baseSemanticChecks) !== JSON.stringify(headSemanticChecks)) changes.semanticChecks.push({ change: 'modified', base: baseSemanticChecks, head: headSemanticChecks });
+  const receipt = { schemaVersion: 1, ok: true, command: 'compare', type: 'workflow', comparatorVersion: 1, diagnostics: [], changes, summary: Object.fromEntries(Object.entries(changes).map(([name, entries]) => [name, entries.length])) };
+  if (!publishReceipt(receipt)) return;
+  if (json) process.stdout.write(`${JSON.stringify(receipt)}\n`);
+  else {
+    const total = Object.values(receipt.summary).reduce((count, entries) => count + entries, 0);
+    const details = total ? `\n${JSON.stringify(receipt.changes, null, 2)}` : '';
+    process.stdout.write(`Workflow changes: ${total}${details}\n`);
+  }
+}
+
 async function commandCompare(args) {
+  if (args[0] === 'workflow') return commandCompareWorkflow(args);
   await loadSidecarPathRuntime();
   const {
     canonicalFuturePath,
